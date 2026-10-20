@@ -314,9 +314,10 @@ describe("OpenCode 2 package entrypoint", () => {
                 { type: "reasoning", text: "Thinking" },
                 {
                   type: "tool-call",
-                  id: "call-1",
-                  name: "read",
+                  toolCallId: "call-1",
+                  toolName: "read",
                   input: { path: "README.md" },
+                  providerExecuted: false,
                 },
               ],
             }),
@@ -326,6 +327,122 @@ describe("OpenCode 2 package entrypoint", () => {
     });
     await cleanup?.();
   });
+
+  test.each([false, true])(
+    "captures tool output before step completion with providerExecuted=%s and late execution hooks",
+    async (executed) => {
+      let executeBefore:
+        | ((input: {
+            id: string;
+            messageID: string;
+            sessionID: string;
+            tool: string;
+            input: Record<string, unknown>;
+          }) => void)
+        | undefined;
+      const registration = { dispose: vi.fn(() => Promise.resolve()) };
+      const contextInput: unknown = {
+        app: { version: "2.0.4" },
+        session: { hook: vi.fn(() => Promise.resolve(registration)) },
+        tool: {
+          hook: vi.fn((name: string, handler: typeof executeBefore) => {
+            if (name === "execute.before") {
+              executeBefore = handler;
+            }
+            return Promise.resolve(registration);
+          }),
+        },
+        event: {
+          subscribe: () => ({
+            async *[Symbol.asyncIterator]() {
+              await Promise.resolve();
+              yield {
+                type: "session.step.started",
+                created: 100,
+                data: {
+                  sessionID: "session-1",
+                  assistantMessageID: "assistant-1",
+                  agent: "build",
+                  model: { id: "model-1", providerID: "provider-1" },
+                },
+              };
+              yield {
+                type: "session.tool.input.started",
+                data: {
+                  assistantMessageID: "assistant-1",
+                  id: "call-1",
+                  name: "read",
+                },
+              };
+              for (let repeat = 0; repeat < 2; repeat++) {
+                yield {
+                  type: "session.tool.called",
+                  data: {
+                    assistantMessageID: "assistant-1",
+                    id: "call-1",
+                    input: { path: "README.md" },
+                    executed,
+                  },
+                };
+              }
+              yield {
+                type: "session.step.ended",
+                created: 200,
+                data: {
+                  sessionID: "session-1",
+                  assistantMessageID: "assistant-1",
+                  finish: "tool-calls",
+                  cost: 0,
+                  tokens: {
+                    input: 10,
+                    output: 5,
+                    reasoning: 0,
+                    cache: { read: 0, write: 0 },
+                  },
+                },
+              };
+              if (!executed) {
+                executeBefore?.({
+                  sessionID: "session-1",
+                  messageID: "assistant-1",
+                  id: "call-1",
+                  tool: "read",
+                  input: { path: "README.md" },
+                });
+              }
+            },
+          }),
+        },
+      };
+      const context = Schema.decodeUnknownSync(
+        Schema.declare(
+          (input): input is Parameters<typeof SourcePlugin.setup>[0] =>
+            typeof input === "object" && input !== null,
+        ),
+      )(contextInput);
+      const cleanup = await SourcePlugin.setup(context);
+      await cleanup?.();
+      expect(runtime.traceGeneration).toHaveBeenCalledTimes(1);
+      expect(runtime.traceGeneration).toHaveBeenCalledWith(
+        expect.objectContaining({
+          output: [
+            {
+              role: "assistant",
+              content: [
+                {
+                  type: "tool-call",
+                  toolCallId: "call-1",
+                  toolName: "read",
+                  input: { path: "README.md" },
+                  providerExecuted: executed,
+                },
+              ],
+            },
+          ],
+        }),
+      );
+    },
+  );
 
   test("captures the complete model input from each context hook", async () => {
     let context:

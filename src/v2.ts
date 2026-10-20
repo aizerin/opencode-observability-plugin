@@ -5,6 +5,32 @@ import { Effect } from "effect";
 import type { ToolDefinition } from "./langfuse.js";
 import { createLangfuseRuntime } from "./runtime.js";
 
+function formatMessages(messages: SessionHooks["context"]["messages"]) {
+  return messages.map((message) => ({
+    role: message.role,
+    content: message.content.map((part) => {
+      if (part.type === "tool-call") {
+        const { id, name, ...rest } = part;
+        return { ...rest, toolCallId: id, toolName: name };
+      }
+      if (part.type === "tool-result") {
+        const { id, name, result, ...rest } = part;
+        return {
+          ...rest,
+          toolCallId: id,
+          toolName: name,
+          output:
+            result.type === "error"
+              ? { ...result, type: "error-text" }
+              : result,
+          ...(result.type === "error" ? { isError: true } : {}),
+        };
+      }
+      return part;
+    }),
+  }));
+}
+
 const LangfusePlugin = {
   id: "langfuse.observability",
   async setup(ctx) {
@@ -33,6 +59,7 @@ const LangfusePlugin = {
         model: { id: string; providerID: string; variant?: string };
         started: number;
         content: SessionHooks["context"]["messages"][number]["content"][number][];
+        toolNames: Map<string, string>;
       }
     >();
 
@@ -69,7 +96,7 @@ const LangfusePlugin = {
         );
         langfuse.setGenerationInputSnapshot(input.sessionID, {
           system: input.system,
-          messages: input.messages,
+          messages: formatMessages(input.messages),
           tools,
         });
       }),
@@ -89,6 +116,8 @@ const LangfusePlugin = {
             id: input.id,
             name: input.tool,
             input: input.input,
+            // Replayed calls carry false; omission changes transcript message identity.
+            providerExecuted: false,
           });
         }
         langfuse.rememberToolCall({
@@ -165,6 +194,7 @@ const LangfusePlugin = {
               model: event.data.model,
               started: event.created,
               content: [],
+              toolNames: new Map(),
             });
             langfuse.startActiveGenerationStep({
               sessionID: event.data.sessionID,
@@ -188,6 +218,38 @@ const LangfusePlugin = {
               ?.content.push({ type: "reasoning", text: event.data.text });
           }
 
+          if (event.type === "session.tool.input.started") {
+            generationDetails
+              .get(event.data.assistantMessageID)
+              ?.toolNames.set(event.data.id, event.data.name);
+          }
+
+          if (event.type === "session.tool.called") {
+            const details = generationDetails.get(
+              event.data.assistantMessageID,
+            );
+            const name = details?.toolNames.get(event.data.id);
+            if (details && name !== undefined) {
+              const call = {
+                type: "tool-call" as const,
+                id: event.data.id,
+                name,
+                input: event.data.input,
+                providerExecuted: event.data.executed,
+              };
+              const index = details.content.findIndex(
+                (part) =>
+                  part.type === "tool-call" && part.id === event.data.id,
+              );
+              // Execution hooks can run after the step has already been finalized.
+              if (index < 0) {
+                details.content.push(call);
+              } else {
+                details.content[index] = call;
+              }
+            }
+          }
+
           if (event.type === "session.step.ended") {
             const details = generationDetails.get(
               event.data.assistantMessageID,
@@ -209,12 +271,12 @@ const LangfusePlugin = {
               finish: event.data.finish,
               cost: event.data.cost,
               tokens: event.data.tokens,
-              output: [
+              output: formatMessages([
                 {
                   role: "assistant",
                   content: details.content,
                 },
-              ],
+              ]),
             });
             generationDetails.delete(event.data.assistantMessageID);
           }
